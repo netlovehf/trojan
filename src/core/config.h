@@ -30,7 +30,8 @@ public:
     enum RunType {
         SERVER,
         CLIENT,
-        FORWARD
+        FORWARD,
+        NAT
     } run_type;
     std::string local_addr;
     uint16_t local_port;
@@ -49,6 +50,7 @@ public:
         std::string key;
         std::string key_password;
         std::string cipher;
+        std::string cipher_tls13;
         bool prefer_server_cipher;
         std::string sni;
         std::string alpn;
@@ -64,6 +66,7 @@ public:
         bool prefer_ipv4;
         bool no_delay;
         bool keep_alive;
+        bool reuse_port;
         bool fast_open;
         int fast_open_qlen;
     } tcp;

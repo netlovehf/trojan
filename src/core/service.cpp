@@ -26,15 +26,23 @@
 #include <wincrypt.h>
 #include <tchar.h>
 #endif // _WIN32
+#ifdef __MACH__
+#include <Security/Security.h>
+#endif // __MACH__
 #include <openssl/opensslv.h>
-#include "serversession.h"
-#include "clientsession.h"
-#include "forwardsession.h"
-#include "ssldefaults.h"
-#include "sslsession.h"
+#include "session/serversession.h"
+#include "session/clientsession.h"
+#include "session/forwardsession.h"
+#include "session/natsession.h"
+#include "ssl/ssldefaults.h"
+#include "ssl/sslsession.h"
 using namespace std;
 using namespace boost::asio::ip;
 using namespace boost::asio::ssl;
+
+#ifdef ENABLE_REUSE_PORT
+typedef boost::asio::detail::socket_option::boolean<SOL_SOCKET, SO_REUSEPORT> reuse_port;
+#endif // ENABLE_REUSE_PORT
 
 Service::Service(Config &config, bool test) :
     config(config),
@@ -42,11 +50,25 @@ Service::Service(Config &config, bool test) :
     ssl_context(context::sslv23),
     auth(nullptr),
     udp_socket(io_context) {
+#ifndef ENABLE_NAT
+    if (config.run_type == Config::NAT) {
+        throw runtime_error("NAT is not supported");
+    }
+#endif // ENABLE_NAT
     if (!test) {
         tcp::resolver resolver(io_context);
         tcp::endpoint listen_endpoint = *resolver.resolve(config.local_addr, to_string(config.local_port)).begin();
         socket_acceptor.open(listen_endpoint.protocol());
         socket_acceptor.set_option(tcp::acceptor::reuse_address(true));
+
+        if (config.tcp.reuse_port) {
+#ifdef ENABLE_REUSE_PORT
+            socket_acceptor.set_option(reuse_port(true));
+#else  // ENABLE_REUSE_PORT
+            Log::log_with_date_time("TCP_REUSEPORT is not supported", Log::WARN);
+#endif // ENABLE_REUSE_PORT
+        }
+
         socket_acceptor.bind(listen_endpoint);
         socket_acceptor.listen();
         if (config.run_type == Config::FORWARD) {
@@ -133,6 +155,56 @@ Service::Service(Config &config, bool test) :
                     CertCloseStore(h_store, 0);
                 }
 #endif // _WIN32
+#ifdef __MACH__
+                SecKeychainSearchRef pSecKeychainSearch = NULL;
+                SecKeychainRef pSecKeychain;
+                OSStatus status = noErr;
+                X509 *cert = NULL;
+
+                // Leopard and above store location
+                status = SecKeychainOpen ("/System/Library/Keychains/SystemRootCertificates.keychain", &pSecKeychain);
+                if (status == noErr) {
+                    X509_STORE *store = SSL_CTX_get_cert_store(native_context);
+                    status = SecKeychainSearchCreateFromAttributes (pSecKeychain, kSecCertificateItemClass, NULL, &pSecKeychainSearch);
+                     for (;;) {
+                        SecKeychainItemRef pSecKeychainItem = nil;
+
+                        status = SecKeychainSearchCopyNext (pSecKeychainSearch, &pSecKeychainItem);
+                        if (status == errSecItemNotFound) {
+                            break;
+                        }
+                        
+                        if (status == noErr) {
+                            void *_pCertData;
+                            UInt32 _pCertLength;
+                            status = SecKeychainItemCopyAttributesAndData (pSecKeychainItem, NULL, NULL, NULL, &_pCertLength, &_pCertData);
+
+                            if (status == noErr && _pCertData != NULL) {
+                                unsigned char *ptr;
+
+                                ptr = (unsigned char *)_pCertData;       /*required because d2i_X509 is modifying pointer */
+                                cert = d2i_X509 (NULL, (const unsigned char **) &ptr, _pCertLength);
+                                if (cert == NULL) {
+                                    continue;
+                                }
+   
+                                if (!X509_STORE_add_cert (store, cert)) {
+                                    X509_free (cert);
+                                    continue;
+                                }
+                                X509_free (cert);
+
+                                status = SecKeychainItemFreeAttributesAndData (NULL, _pCertData);
+                            }
+                        }
+                        if (pSecKeychainItem != NULL) {
+                            CFRelease (pSecKeychainItem);
+                        }
+                    }
+                    CFRelease (pSecKeychainSearch);
+                    CFRelease (pSecKeychain);
+                }
+#endif // __MACH__
             } else {
                 ssl_context.load_verify_file(config.ssl.cert);
             }
@@ -162,6 +234,14 @@ Service::Service(Config &config, bool test) :
     if (config.ssl.cipher != "") {
         SSL_CTX_set_cipher_list(native_context, config.ssl.cipher.c_str());
     }
+    if (config.ssl.cipher_tls13 != "") {
+#ifdef ENABLE_TLS13_CIPHERSUITES
+        SSL_CTX_set_ciphersuites(native_context, config.ssl.cipher_tls13.c_str());
+#else  // ENABLE_TLS13_CIPHERSUITES
+        Log::log_with_date_time("TLS1.3 ciphersuites are not supported", Log::WARN);
+#endif // ENABLE_TLS13_CIPHERSUITES
+    }
+
     if (!test) {
         if (config.tcp.no_delay) {
             socket_acceptor.set_option(tcp::no_delay(true));
@@ -209,6 +289,8 @@ void Service::run() {
         rt = "server";
     } else if (config.run_type == Config::FORWARD) {
         rt = "forward";
+    } else if (config.run_type == Config::NAT) {
+        rt = "nat";
     } else {
         rt = "client";
     }
@@ -233,6 +315,8 @@ void Service::async_accept() {
         session = make_shared<ServerSession>(config, io_context, ssl_context, auth, plain_http_response);
     } else if (config.run_type == Config::FORWARD) {
         session = make_shared<ForwardSession>(config, io_context, ssl_context);
+    } else if (config.run_type == Config::NAT) {
+        session = make_shared<NATSession>(config, io_context, ssl_context);
     } else {
         session = make_shared<ClientSession>(config, io_context, ssl_context);
     }
